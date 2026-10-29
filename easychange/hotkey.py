@@ -13,7 +13,7 @@ import sys
 from ctypes import wintypes
 from pathlib import Path
 
-from . import config
+from . import config, winutil
 
 MOD = {"alt": 0x1, "ctrl": 0x2, "control": 0x2, "shift": 0x4, "win": 0x8}
 MOD_NOREPEAT = 0x4000
@@ -129,12 +129,64 @@ def selected_files(hwnd: int) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# Where is the file's icon? (so the wheel opens right on top of it)
+# --------------------------------------------------------------------------- #
+
+_uia = None
+
+
+def _automation():
+    global _uia
+    if _uia is None:
+        import comtypes.client
+        comtypes.client.GetModule("UIAutomationCore.dll")
+        from comtypes.gen.UIAutomationClient import CUIAutomation, IUIAutomation
+        _uia = comtypes.client.CreateObject(CUIAutomation, interface=IUIAutomation)
+    return _uia
+
+
+def icon_position(files: list[str]) -> tuple[int, int] | None:
+    """Screen position of the selected file's icon in Explorer, via UI Automation
+    (the accessibility API). None if it can't be found; the wheel then opens at
+    the mouse pointer."""
+    try:
+        el = _automation().GetFocusedElement()
+        name = (el.CurrentName or "").lower()
+        # Explorer may hide extensions, so accept "report" as well as "report.docx".
+        names = {Path(f).name.lower() for f in files} | {Path(f).stem.lower() for f in files}
+        if name not in names:
+            return None
+        r = el.CurrentBoundingRectangle
+        w, h = r.right - r.left, r.bottom - r.top
+        if w <= 0 or h <= 0:
+            return None
+        if w > 3 * h:  # a row in Details/List view: the icon is at its left end
+            return r.left + h, r.top + h // 2
+        return (r.left + r.right) // 2, (r.top + r.bottom) // 2
+    except Exception:
+        logging.exception("Finding the icon position failed")
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Listener loop
 # --------------------------------------------------------------------------- #
 
-def _launch(args: list[str]) -> None:
+def _launch(args: list[str], at: tuple[int, int] | None = None) -> None:
     ctypes.windll.user32.AllowSetForegroundWindow(-1)  # let the popup take focus
+    if at:
+        args = [f"--at={at[0]},{at[1]}"] + args
     subprocess.Popen(launcher_command() + args, close_fds=True)
+
+
+def _file_args(files: list[str]) -> list[str]:
+    if len(files) == 1:
+        return [files[0]]
+    # Many paths could exceed the command-line length limit; pass them in a file
+    # (the wheel deletes it after reading).
+    lst = config.app_dir() / f"selection-{os.getpid()}-{id(files)}.txt"
+    lst.write_text("\n".join(files), encoding="utf-8")
+    return ["--files-from", str(lst)]
 
 
 def on_hotkey() -> None:
@@ -145,7 +197,7 @@ def on_hotkey() -> None:
         logging.exception("Reading the Explorer selection failed")
         files = []
     if files:
-        _launch([files[0]])
+        _launch(_file_args(files), icon_position(files))
     elif _class_name(hwnd) in ("CabinetWClass", "ExploreWClass", "Progman", "WorkerW"):
         _launch(["--message", "Select a file first"])
     # In any other app the shortcut does nothing, so it doesn't get in the way.
@@ -153,6 +205,7 @@ def on_hotkey() -> None:
 
 def run() -> int:
     kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+    winutil.enable_dpi_awareness()  # so icon positions match the wheel's pixels
     kernel32.CreateMutexW(None, False, "Local\\EasyChangeHotkey")
     if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
         return 0  # already running

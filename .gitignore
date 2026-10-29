@@ -21,3 +21,7 @@ env/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Claude rules: kept private (in the cloud environment setup script / ~/.claude)
+CLAUDE.md
+CLAUDE.local.md

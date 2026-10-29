@@ -22,12 +22,13 @@ from typing import Callable
 IS_WINDOWS = sys.platform == "win32"
 NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # CREATE_NO_WINDOW: no console flash
 
-ALIASES = {"jpeg": "jpg", "tif": "tiff", "htm": "html", "markdown": "md"}
+ALIASES = {"jpeg": "jpg", "tif": "tiff", "htm": "html", "markdown": "md",
+           "heif": "heic", "hif": "heic"}
 
 # Order in which targets are shown on the wheel (most useful first).
 POPULARITY = [
     "pdf", "docx", "jpg", "png", "txt", "mp3", "mp4", "xlsx", "csv", "pptx",
-    "webp", "html", "odt", "rtf", "doc", "gif", "wav", "json", "md", "ods",
+    "webp", "avif", "html", "odt", "rtf", "doc", "gif", "wav", "json", "md", "ods",
     "odp", "bmp", "tiff", "ico", "flac", "ogg", "m4a", "aac", "opus", "mkv",
     "mov", "avi", "webm", "xls", "ppt",
 ]
@@ -122,15 +123,39 @@ def _run(cmd: list[str], timeout: int = 600) -> None:
 
 # ---- Images (Pillow) ------------------------------------------------------ #
 
-def _pillow_convert(src: Path, dst: Path, ext: str) -> None:
-    from PIL import Image, ImageSequence
+@functools.cache
+def _heic_ok() -> bool:
+    """iPhone photos (HEIC) need the pillow-heif plugin."""
+    if not _has_module("pillow_heif"):
+        return False
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    return True
 
+
+@functools.cache
+def _avif_ok() -> bool:
+    try:
+        from PIL import features
+        return bool(features.check_module("avif"))
+    except Exception:
+        return False
+
+
+def _pillow_convert(src: Path, dst: Path, ext: str) -> None:
+    from PIL import Image, ImageOps, ImageSequence
+
+    if norm_ext(src) == "heic" and not _heic_ok():
+        raise ConversionError("HEIC support (pillow-heif) is not installed")
     with Image.open(src) as im:
         if ext == "gif" and getattr(im, "is_animated", False):
             frames = [f.copy() for f in ImageSequence.Iterator(im)]
             frames[0].save(dst, save_all=True, append_images=frames[1:], loop=0)
             return
         im.load()
+        # Phone photos are often stored sideways with a "rotate me" tag that many
+        # formats can't carry; apply the rotation so the result looks right.
+        im = ImageOps.exif_transpose(im)
         if ext in ("jpg", "pdf", "bmp"):
             # Formats without alpha: flatten onto white instead of turning it black.
             if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
@@ -150,8 +175,12 @@ def _pillow_convert(src: Path, dst: Path, ext: str) -> None:
 
 
 PILLOW = Backend("Pillow", lambda: _has_module("PIL"), _pillow_convert)
+AVIF = Backend("Pillow AVIF", _avif_ok, _pillow_convert)
+HEIC = Backend("Pillow HEIC", _heic_ok, _pillow_convert)
+HEIC_AVIF = Backend("Pillow HEIC+AVIF", lambda: _heic_ok() and _avif_ok(), _pillow_convert)
 IMAGE_IN = ["png", "jpg", "bmp", "gif", "webp", "tiff", "ico"]
 IMAGE_OUT = ["png", "jpg", "bmp", "gif", "webp", "tiff", "ico", "pdf"]
+IMAGES = IMAGE_IN + ["avif", "heic"]  # everything that counts as an image
 
 
 # ---- Microsoft Office via COM --------------------------------------------- #
@@ -428,6 +457,10 @@ ROUTES: list[Route] = [
     Route("csv", "xlsx", _py("openpyxl", _csv_to_xlsx, "openpyxl")),
     Route("xlsx", "csv", _py("openpyxl", _xlsx_to_csv, "openpyxl")),
     *_routes(PILLOW, IMAGE_IN, IMAGE_OUT),
+    *_routes(AVIF, IMAGE_IN, ["avif"]),
+    *_routes(AVIF, ["avif"], IMAGE_OUT),
+    *_routes(HEIC, ["heic"], IMAGE_OUT),
+    Route("heic", "avif", HEIC_AVIF),
     *_routes(WORD, ["docx", "doc", "odt", "rtf"], list(WORD_FORMATS)),
     Route("pdf", "docx", WORD),  # Word turns PDFs into editable documents
     *_routes(PDFIUM, ["pdf"], ["png", "jpg", "webp"]),
@@ -477,6 +510,14 @@ def unique_output_path(src: Path, ext: str) -> Path:
     return out
 
 
+def _friendly(e: Exception, src: Path) -> str:
+    """Error text for the red bar: no full paths, no library jargon."""
+    msg = (str(e) or type(e).__name__).replace(f"'{src}'", src.name).replace(str(src), src.name)
+    if "cannot identify image file" in msg:
+        return "Not a valid image (or the file is damaged)"
+    return msg
+
+
 def convert(path: str | Path, ext: str) -> Path:
     """Convert `path` to `ext` next to the original. The original is never modified."""
     src = Path(path).resolve()
@@ -494,11 +535,122 @@ def convert(path: str | Path, ext: str) -> Path:
         except Exception as e:  # try the next backend that offers this pair
             if dst.is_file():
                 dst.unlink(missing_ok=True)
-            errors.append(f"{r.backend.name}: {e}")
+            errors.append(_friendly(e, src))
             continue
         if out.is_dir() or (out.exists() and out.stat().st_size > 0):
             return out
-        errors.append(f"{r.backend.name}: produced no output")
+        errors.append(f"{r.backend.name} produced no output")
     if not errors:
         raise ConversionError(f"Can't convert .{s} to .{ext} on this PC")
     raise ConversionError(errors[-1])
+
+
+# --------------------------------------------------------------------------- #
+# Several files at once
+# --------------------------------------------------------------------------- #
+
+COMBINE = "combine-pdf"  # special wheel option: merge images/PDFs into one PDF
+
+
+def label(target: str) -> str:
+    """Text for a wheel slot."""
+    return "1 PDF" if target == COMBINE else target.upper()
+
+
+def _can_combine(paths: list[Path]) -> bool:
+    if len(paths) < 2 or not _has_module("pypdfium2"):
+        return False
+    exts = {norm_ext(p) for p in paths}
+    if not exts <= set(IMAGES) | {"pdf"}:
+        return False
+    return ("heic" not in exts or _heic_ok()) and ("avif" not in exts or _avif_ok())
+
+
+def shared_targets(paths: list[str | Path]) -> list[str]:
+    """Targets offered for a selection. With several files, a type is offered if
+    every file can become it (files already of that type are just skipped)."""
+    paths = [Path(p) for p in paths]
+    if len(paths) == 1:
+        return targets_for(paths[0])
+    per_ext = {}
+    for p in paths:
+        e = norm_ext(p)
+        if e not in per_ext:
+            per_ext[e] = set(targets_for(p))
+    candidates = set().union(*per_ext.values())
+    result = sorted((t for t in candidates
+                     if all(t in ts or e == t for e, ts in per_ext.items())), key=_rank)
+    if _can_combine(paths):
+        result.insert(1 if result[:1] == ["pdf"] else 0, COMBINE)
+    return result
+
+
+def _natural_key(p: Path):
+    import re
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", p.name)]
+
+
+def combine_pdf(paths: list[str | Path]) -> Path:
+    """Merge images and PDFs (sorted by name, like Explorer) into 'Combined.pdf'."""
+    import io
+
+    import pypdfium2 as pdfium
+    from PIL import Image, ImageOps
+
+    files = sorted((Path(p).resolve() for p in paths), key=_natural_key)
+    folder = files[0].parent
+    dst = folder / "Combined.pdf"
+    n = 2
+    while dst.exists():
+        dst = folder / f"Combined ({n}).pdf"
+        n += 1
+
+    out = pdfium.PdfDocument.new()
+    sources = []  # keep imported documents open until the result is saved
+    try:
+        for f in files:
+            try:
+                if norm_ext(f) == "pdf":
+                    doc = pdfium.PdfDocument(f)
+                else:
+                    if norm_ext(f) == "heic":
+                        _heic_ok()
+                    with Image.open(f) as im:
+                        im = ImageOps.exif_transpose(im)
+                        if im.mode != "RGB":
+                            rgba = im.convert("RGBA")
+                            im = Image.new("RGB", rgba.size, (255, 255, 255))
+                            im.paste(rgba, mask=rgba.getchannel("A"))
+                        # Size the page so the long side is about 11 inches (A4/Letter).
+                        dpi = max(72.0, max(im.size) / 11.0)
+                        buf = io.BytesIO()
+                        im.save(buf, "PDF", resolution=dpi)
+                    doc = pdfium.PdfDocument(buf.getvalue())
+            except Exception as e:
+                raise ConversionError(f"Couldn't read {f.name} ({e})")
+            sources.append(doc)
+            out.import_pages(doc)
+        out.save(dst)
+    finally:
+        out.close()
+        for d in sources:
+            d.close()
+    return dst
+
+
+def convert_many(paths: list[str | Path], target: str, progress=None):
+    """Convert a selection. Returns (outputs, failures) where failures is a list of
+    (path, message). `progress(done, total)` is called after each file."""
+    paths = [Path(p) for p in paths]
+    if target == COMBINE:
+        return [combine_pdf(paths)], []
+    todo = [p for p in paths if norm_ext(p) != target]
+    outputs, failures = [], []
+    for i, p in enumerate(todo, 1):
+        try:
+            outputs.append(convert(p, target))
+        except Exception as e:
+            failures.append((p, str(e) or type(e).__name__))
+        if progress:
+            progress(i, len(todo))
+    return outputs, failures

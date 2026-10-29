@@ -110,9 +110,10 @@ class Popup:
 class Wheel(Popup):
     R_OUT, R_IN = 118, 44
 
-    def __init__(self, file: Path, targets: list[str], at=None):
+    def __init__(self, files: list[Path], targets: list[str], at=None):
         super().__init__(at)
-        self.file, self.targets = file, targets
+        self.files, self.targets = files, targets
+        self.progress: tuple[int, int] | None = None  # (done, total) for batches
         self.sel: int | None = None  # index into targets
         self.offset = 0              # first target shown when there are > 8
         self.busy = False
@@ -202,26 +203,27 @@ class Wheel(Popup):
             if self.slots == 1:
                 lx, ly = cx, cy - lr
             dim = self.busy and not active
-            cv.create_text(lx, ly, text=self.targets[idx].upper(),
+            cv.create_text(lx, ly, text=converters.label(self.targets[idx]),
                            fill=C["muted"] if dim else C["text"],
                            font=self.font_bold if active else self.font)
 
         # Center hub: source type on top, chosen target below.
         cv.create_oval(cx - ri, cy - ri, cx + ri, cy + ri, fill=C["center"],
                        outline=C["ring_edge"], width=self.px(1.5))
-        src = converters.norm_ext(self.file).upper() or "FILE"
         if self.busy:
             a = self.spin
             rr = ri - self.px(5)
             cv.create_arc(cx - rr, cy - rr, cx + rr, cy + rr, start=a, extent=100,
                           style="arc", outline=C["seg_busy"], width=self.px(3))
-            cv.create_text(cx, cy, text="…", fill=C["text"], font=self.font_bold)
+            text = "%d/%d" % self.progress if self.progress else "…"
+            cv.create_text(cx, cy, text=text, fill=C["text"], font=self.font_bold)
             return
         if k < 0.95:
             return
-        cv.create_text(cx, cy - self.px(10), text=src, fill=C["muted"], font=self.font)
+        cv.create_text(cx, cy - self.px(10), text=self.source_label(), fill=C["muted"],
+                       font=self.font)
         if self.sel is not None:
-            label = "→ " + self.targets[self.sel].upper()
+            label = "→ " + converters.label(self.targets[self.sel])
         else:
             label = "Esc"
         cv.create_text(cx, cy + self.px(9), text=label,
@@ -232,6 +234,13 @@ class Wheel(Popup):
             pos = (self.sel if self.sel is not None else self.offset) + 1
             cv.create_text(cx, cy + self.px(27), text=f"{pos}/{len(self.targets)}",
                            fill=C["muted"], font=(FONT[0], max(FONT[1] - 3, 6)))
+
+    def source_label(self) -> str:
+        """'DOCX' for one file, '3 PNG' for three PNGs, '5 FILES' for a mix."""
+        exts = {converters.norm_ext(f).upper() or "FILE" for f in self.files}
+        if len(self.files) == 1:
+            return exts.pop()
+        return f"{len(self.files)} {exts.pop() if len(exts) == 1 else 'FILES'}"
 
     def _animate_open(self) -> None:
         if self.grow < 1:
@@ -281,33 +290,53 @@ class Wheel(Popup):
         if self.busy or idx is None or not (0 <= idx < len(self.targets)):
             return
         self.sel, self.busy = idx, True
-        ext = self.targets[idx]
+        target = self.targets[idx]
         self.draw()
 
         def work():
             try:
-                self.results.put(("ok", converters.convert(self.file, ext)))
+                done = converters.convert_many(
+                    self.files, target,
+                    progress=lambda d, t: t > 1 and self.results.put(("progress", (d, t))))
+                for path, msg in done[1]:
+                    logging.error("Converting %s to %s failed: %s", path, target, msg)
+                self.results.put(("done", done))
             except Exception as e:
-                logging.exception("Converting %s to %s failed", self.file, ext)
+                logging.exception("Converting %s to %s failed", self.files, target)
                 self.results.put(("err", e))
 
         threading.Thread(target=work, daemon=True).start()
         self._poll()
 
     def _poll(self) -> None:
-        try:
-            kind, value = self.results.get_nowait()
-        except queue.Empty:
-            self.spin = (self.spin - 12) % 360
-            self.draw()
-            self.root.after(30, self._poll)
+        while True:
+            try:
+                kind, value = self.results.get_nowait()
+            except queue.Empty:
+                self.spin = (self.spin - 12) % 360
+                self.draw()
+                self.root.after(30, self._poll)
+                return
+            if kind != "progress":
+                break
+            self.progress = value
+        if kind == "err":
+            self.bar(shorten(str(value) or type(value).__name__, 90), "err", 6000)
             return
-        if kind == "ok":
-            self.bar(f"Saved {value.name}", "ok", 3500,
-                     on_click=lambda: reveal_in_explorer(value))
-        else:
-            msg = str(value) or type(value).__name__
+        outputs, failures = value
+        reveal = (lambda: reveal_in_explorer(outputs[0])) if outputs else None
+        first_err = shorten(f"{failures[0][0].name}: {failures[0][1]}", 60) if failures else ""
+        if not failures:
+            text = f"Saved {outputs[0].name}" if len(outputs) == 1 else f"Saved {len(outputs)} files"
+            self.bar(text, "ok", 3500, on_click=reveal)
+        elif outputs:
+            self.bar(f"Saved {len(outputs)}, {len(failures)} failed: {first_err}", "err", 7000,
+                     on_click=reveal)
+        elif len(failures) == 1:
+            msg = failures[0][1] if len(self.files) == 1 else f"{failures[0][0].name}: {failures[0][1]}"
             self.bar(shorten(msg, 90), "err", 6000)
+        else:
+            self.bar(f"All {len(failures)} failed: {first_err}", "err", 7000)
 
 
 def shorten(s: str, n: int) -> str:
@@ -331,17 +360,20 @@ def rounded_rect(cv: tk.Canvas, x1, y1, x2, y2, r, **kw):
     return cv.create_polygon(pts, smooth=True, **kw)
 
 
-def open_for(path: str | os.PathLike, at=None) -> None:
-    """Entry point: show the wheel for a file, or the 'nothing available' bar."""
-    file = Path(path)
-    if not file.is_file():
+def open_for(paths: list[str | os.PathLike], at=None) -> None:
+    """Entry point: show the wheel for the selected file(s), or the
+    'nothing available' bar."""
+    files = [Path(p) for p in paths if Path(p).is_file()]
+    if not files:
         message("Select a file (not a folder) to change its type", at=at)
         return
-    targets = converters.targets_for(file)
+    targets = converters.shared_targets(files)
     if not targets:
-        message("No available file types to change to", at=at)
+        text = ("No available file types to change to" if len(files) == 1
+                else "No file type all of these can change to")
+        message(text, at=at)
         return
-    Wheel(file, targets, at).run()
+    Wheel(files, targets, at).run()
 
 
 def message(text: str, kind: str = "info", at=None) -> None:

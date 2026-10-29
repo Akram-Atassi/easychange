@@ -151,3 +151,80 @@ def test_pdf_text_roundtrip(tmp_path):
     d.save(src)
     pdf = c.convert(src, "pdf")
     assert "Dear wheel, hello from page one." in c.convert(pdf, "txt").read_text()
+
+
+@pytest.mark.skipif(not c._heic_ok(), reason="pillow-heif not installed")
+def test_heic_to_jpg(tmp_path):
+    src = tmp_path / "IMG_0001.HEIC"
+    Image.new("RGB", (64, 48), "blue").save(src, "HEIF")
+    t = c.targets_for(src)
+    assert t[:3] == ["pdf", "jpg", "png"] and "heic" not in t
+    with Image.open(c.convert(src, "jpg")) as im:
+        assert im.format == "JPEG" and im.size == (64, 48)
+
+
+@pytest.mark.skipif(not c._avif_ok(), reason="Pillow built without AVIF")
+def test_avif_roundtrip(tmp_path):
+    src = tmp_path / "a.png"
+    Image.new("RGB", (32, 32), "green").save(src)
+    assert "avif" in c.targets_for(src)
+    avif = c.convert(src, "avif")
+    assert "png" in c.targets_for(avif)
+    with Image.open(c.convert(avif, "png")) as im:
+        assert im.size == (32, 32)
+
+
+def test_photo_rotation_is_applied(tmp_path):
+    src = tmp_path / "phone.jpg"
+    exif = Image.Exif()
+    exif[0x0112] = 6  # "rotate 90° clockwise to display"
+    Image.new("RGB", (40, 20), "red").save(src, exif=exif)
+    with Image.open(c.convert(src, "png")) as im:
+        assert im.size == (20, 40)
+
+
+def test_shared_targets_for_a_mixed_selection(tmp_path):
+    t = c.shared_targets([tmp_path / "a.png", tmp_path / "b.jpg"])
+    # jpg is offered: the png gets converted and the jpg is skipped.
+    assert t[:2] == ["pdf", c.COMBINE] and "jpg" in t and "png" in t
+    assert c.shared_targets([tmp_path / "a.docx", tmp_path / "b.xyz"]) == []
+    assert c.COMBINE not in c.shared_targets([tmp_path / "a.png"])
+    assert c.COMBINE not in c.shared_targets([tmp_path / "a.png", tmp_path / "b.docx"])
+
+
+def test_convert_many_skips_files_already_in_the_target_type(tmp_path):
+    a, b, bad = tmp_path / "a.png", tmp_path / "b.jpg", tmp_path / "c.png"
+    Image.new("RGB", (8, 8)).save(a)
+    Image.new("RGB", (8, 8)).save(b)
+    bad.write_bytes(b"not an image")
+    seen = []
+    outputs, failures = c.convert_many([a, b, bad], "jpg", progress=lambda d, t: seen.append((d, t)))
+    assert [o.name for o in outputs] == ["a.jpg"]
+    assert [f.name for f, _ in failures] == ["c.png"]
+    assert seen == [(1, 2), (2, 2)]
+    assert not (tmp_path / "b (2).jpg").exists()
+
+
+def test_combine_images_and_pdfs_in_name_order(tmp_path):
+    import pypdfium2 as pdfium
+    Image.new("RGBA", (300, 200), (0, 0, 255, 128)).save(tmp_path / "scan 10.png")
+    Image.new("RGB", (200, 300), "red").save(tmp_path / "scan 2.jpg")
+    _make_pdf(tmp_path / "scan 1.pdf", 2)
+    files = [tmp_path / n for n in ("scan 10.png", "scan 2.jpg", "scan 1.pdf")]
+    outputs, failures = c.convert_many(files, c.COMBINE)
+    assert failures == [] and outputs[0].name == "Combined.pdf"
+    pdf = pdfium.PdfDocument(outputs[0])
+    sizes = [pdf[i].get_size() for i in range(len(pdf))]
+    pdf.close()
+    assert len(sizes) == 4  # 2 pages + 2 images
+    assert sizes[2][0] < sizes[2][1] and sizes[3][0] > sizes[3][1]  # "scan 2" before "scan 10"
+    assert c.combine_pdf(files).name == "Combined (2).pdf"
+
+
+def test_combine_reports_unreadable_file(tmp_path):
+    good, bad = tmp_path / "a.png", tmp_path / "b.pdf"
+    Image.new("RGB", (8, 8)).save(good)
+    bad.write_bytes(b"%PDF-broken")
+    with pytest.raises(c.ConversionError, match="b.pdf"):
+        c.combine_pdf([good, bad])
+    assert not (tmp_path / "Combined.pdf").exists()
