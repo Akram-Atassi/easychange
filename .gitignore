@@ -1,0 +1,23 @@
+# PyInstaller output (rebuild with build.ps1)
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+
+# OS clutter
+Thumbs.db
+desktop.ini
+.DS_Store
