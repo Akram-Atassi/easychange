@@ -98,6 +98,13 @@ and open a new window**.
 The program is now at `C:\Tools\easychange\dist\EasyChange\EasyChange.exe`. In
 the commands below, use that path instead of `C:\Tools\EasyChange\EasyChange.exe`.
 
+**Updating later:** if you got the code with `git clone`, one command fetches
+the latest code, rebuilds and reinstalls:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File update.ps1
+```
+
 </details>
 
 ## 3. Turn it on
